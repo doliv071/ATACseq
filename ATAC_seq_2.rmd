@@ -1,0 +1,303 @@
+---
+title: "ATAC_seq_2"
+author: "David Oliver"
+date: "November 12, 2017"
+output: 
+    html_document:
+        toc: true
+        toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F, warning=F)
+```
+
+# 1. ATAC-seq QC
+
+The QC that has been performed up to this point has been to assess the quality of the experiment, sequencing, and the alignment.
+
+```{r Read in the Data}
+
+# load in the packages we will need
+library(edgeR)                              # for differential expression analysis
+library(magrittr)                           # for the pipe function
+library(knitr)                              # making pretty tables
+library(ATACseqQC)                          # for doing..ATAC-seq QC... 
+library(MotifDb)                            # motif database
+library(ChIPpeakAnno)                       # provides functionality for peak data in R
+library(RColorBrewer)                       # better color schemes
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)  # Transcript annotation for hg38
+library(phastCons100way.UCSC.hg38)          # conserved sequence annotation for hg38
+library(BSgenome.Hsapiens.UCSC.hg38)        # hg38 in biostrings format
+library(GenomicAlignments)                  # provides functionality for genomic alignments
+
+# read in the counts per peak (from the featureCounts step)
+counts <- read.delim("R/Peak_counts.txt", skip = 1)
+
+# fix the names
+sample_names <- 
+    strsplit2(colnames(counts), split = "\\.")[-(1:6), 7] %>%
+    strsplit2(., "_") %>%
+    .[, 1]
+colnames(counts) <- c(strsplit2(colnames(counts), split = "\\.")[1:6, 1], sample_names)
+
+# fixing names is like 90% of your job as a bioinformatician, the rest is easy
+counts$Geneid <- 
+    strsplit2(counts$Geneid, split = "_")[, 7:8] %>%
+    apply(., 1, paste, collapse = "_") %>%
+    make.names(., unique = T)
+
+kable(head(counts))
+
+```
+
+There are a lot of advantages to working with data in this format. 
+The main thing is that there are a LOT of tools already developed to handle these types of data.
+
+Looking at some summary statistics.
+
+```{r Summary Statistics of Counts}
+
+# plot the peak size distribution (frequency)
+hist(x = counts$Length, 
+     xlim = c(0,3000), 
+     breaks = 100, 
+     freq = T,
+     main = "Peak Length Frequency Distribution",
+     xlab = "Peak Width", 
+     ylab = "Number of Peaks")
+
+# make a summary table
+summary(counts$Length) %>%
+    t() %>% t() %>%
+    kable(., col.names = "Peaks Length")
+
+```
+
+The minimum length of a peak is 138bp which makes sense since we set `MACS2` parameter to extend to 147bp. So any peaks that were smaller than 147+/- some tolerance were not called as true peaks. 
+
+## A. Fragment Size Distribution
+
+If we want to get a more fine grained look at these data we can look directly at the fragment (reads) sizes from the BAM files.
+
+```{r}
+
+# location of the BAM files
+bamfiles <- dir(path = "R", pattern = "*.bam$", full.names = T)
+
+# names of the BAM files
+bamfile_labels <- strsplit2(dir(path = "R", pattern = "*.bam$"), "\\.")[,1]
+
+# calculate fragment sizes and plot them.
+fragSizeDist(bamfiles[1], bamfile_labels[1])
+fragSizeDist(bamfiles[2], bamfile_labels[2])
+
+```
+
+SRR4044835 (Day 28) seems to be a better experiment, most likely due to higher depth of sequencing and larger FRiP.
+
+Fragment size is the primary reason that ATAC-seq is performed with paired end sequencing. 
+Without paired ends there is no way to get exact fragment size data.
+
+## B. Nucleosome Position at TSSs
+
+From Fragment sizes nucleosome positioning around can be calculated.
+
+```{r}
+
+# get sequence information for chr19 from hg38
+chr19_seq <- as(seqinfo(Hsapiens)["chr19"], "GRanges")
+
+# get transcripts from hg38 UCSC annotation
+chr19_transcripts <- 
+    transcripts(TxDb.Hsapiens.UCSC.hg38.knownGene) %>%
+    .[seqnames(.) %in% "chr19"]
+
+# from transcript annotation pull just the transcription start site
+TSS <- 
+    promoters(chr19_transcripts, upstream = 0, downstream = 1) %>%
+    unique()
+
+# calculate the library size for SRR4044835_chr19
+librarySize <- estLibSize(bamfiles[1])
+
+##################################################
+# This section takes a while to run so it was 
+# pre-run and the output saved as an R object
+# using the saveRDS() function
+##################################################
+# SRR4044835_chr19 <-
+#     readBamFile(bamfiles[1], which = chr19_seq, asMates = T) %>%
+#     shiftGAlignmentsList() %>%
+#     splitGAlignmentsByCut(., 
+#                           txs = chr19_transcripts, 
+#                           genome = Hsapiens, 
+#                           conservation = phastCons100way.UCSC.hg38)
+# 
+# signals <- enrichedFragments(gal = SRR4044835_chr19[c("NucleosomeFree", "mononucleosome",
+#                                                       "dinucleosome", "trinucleosome")],
+#                             TSS         = TSS,
+#                             librarySize = librarySize,
+#                             seqlev      = "chr19",
+#                             TSS.filter  = 0.5,
+#                             n.tile      = 101,
+#                             upstream    = 1010,
+#                             downstream  = 1010)
+# saveRDS(signals, file = "R/signals.rds")
+
+# load in the pre-built signals object
+signals <- readRDS(file = "R/signals.rds")
+
+# log transform the signal at TSSs for better visualiztion
+log_signals <- lapply(signals, function(x) log2(x+1))
+
+# now generate the heatmap for open chromatin signal around TSSs
+featureAlignedHeatmap(log_signals, 
+                      reCenterPeaks(peaks = TSS, width = 1010*2),
+                      zeroAt = 0.5, 
+                      n.tile = 101, 
+                      color = rev(brewer.pal(11, "Spectral")))
+
+```
+
+The nucleosome free fragments is shifted upstream of the TSS while the mononucleosomal fragments are shifted slightly downstream.
+
+Using a density plot can often be more informative than the much prettier heatmap.
+
+```{r, include=F}
+
+# generate signal density profile (same as the heatmap but not log transformed)
+out <- 
+    featureAlignedDistribution(signals, 
+                               reCenterPeaks(TSS, width = 1010*2),
+                               zeroAt = 0.5, 
+                               n.tile = 101, 
+                               type = "l") %>%
+    apply(., 2, scale) # scale and center
+```
+
+```{r}
+
+# plot the density of nucleosome free vs mononucleosome signals
+matplot(out, 
+        type = "l", 
+        xaxt = "n", 
+        xlab = "Position (bp)", 
+        ylab = "Fraction of signal",
+        main = "Nucleosome Positioning Near TSSs")
+
+# pretty x-axis
+axis(1, at = seq(0, 100, by=10)+1, 
+     labels = c("-1K", seq(-800, 800, by=200), "1K"), 
+     las = 3)
+
+# add some verticle lines for easier visualiztion
+abline(v = seq(0, 100, by = 10)+1, 
+       lty = 2, 
+       col = "gray")
+
+```
+
+This profile looks like the genes on `Chr19` have a dominant nucleosome free region about 150-200bp upstream of the start site and mononucleosome signal peak 50-100bp downstream.
+
+Looking at the full dataset, the nucleosome free region peaks about 0-50bp upstream of the transcription start site with a strong valley in the corresponding nucleosome signal. 
+
+![](R/nuc_prof.png){width=70%}
+
+&nbsp;
+
+```{r, include = F}
+
+# fetch the CTCF motif from the database
+CTCF <- 
+    query(MotifDb, c("CTCF")) %>%
+    as.list()
+
+# get the 
+CTCF_Footprint <- factorFootprints("R/SRR4044835_chr19.bam", 
+                                    pfm = CTCF[[1]], 
+                                    genome = Hsapiens,
+                                    min.score = "90%", 
+                                    upstream = 100, 
+                                    downstream = 100)
+
+```
+
+![ATAC-seq signal at CTCF motifs on chr19](R/CTCF_motif_chr19.png)
+
+![ATAC-seq signal at CTCF motifs over the whole genome](R/CTCF_motif_Full_data.png)
+
+The signal doesn't look great. 
+CTCF is a common control motif because it is well studied and known to produce a characteristic value with low signal at the binding site and strong signal adjacent to it. 
+This, more or less, reiterates that the experiment could significantly benefit from additional sequencing.
+
+&nbsp;
+
+# 2. Differentially Open Chromatin
+
+Now that things look copacetic, differentially open chromatin regions can be called. 
+The hypothesis is that HDAC inhibitors should prevent the closure of chromatin.
+
+![Wang, Yu-Chieh et al. Cell research. 24. 2013).](R/HDACi.png)
+
+&nbsp;
+
+## A. Looking at MACS2 Peaks
+
+First let's look at the differentially called peaks.
+Go to [UCSC's genome browser](https://genome.ucsc.edu/).
+Under `MyData` select `Custom Tracks`.
+Above the first empty box select `Choose File`.
+From the `Desktop/ATAC_Seq/R` directory select the `.bed` files from `macs2 bdgdiff` function.
+`Chr19_Diff_Open_Chromatin*` and click submit. 
+Do this for all 3 files.
+
+Change the name by clicking the `Track Name` link and change `cond1` to `Romi_Day28` and `cond2` to `Romi_Day0`
+
+Finally click the `go` button next to the `Genome Browser` dropdown menu.
+
+Play around with looking at a few of the Differentially Open Regions.
+
+&nbsp;
+
+## B. Quantifying Differentially Open Regions
+
+`MACS2` reports a Likelihood ratio but no other statistics for each peak.
+To get a better quantification, call differentially open peaks with `edgeR`
+
+```{r}
+
+#read in the data (chr19 only)
+x <- 
+    read.delim("R/Chr19_Peak_counts.txt", header = T, comment.char = "#")
+x_meta <- x[,2:6]
+rownames(x) <- 
+    strsplit2(x$Geneid, "_")[,8:9] %>%
+    apply(., 1, paste, collapse = "_")
+x <- 
+    x[,-(1:6)] %>%
+    `colnames<-` (., c("Day28", "Day0"))
+
+group <- factor(colnames(x))
+bcv = 0.4
+y <- 
+    DGEList(counts = x, group = group, genes = x_meta) %>%
+    calcNormFactors()
+et <- exactTest(y, dispersion = bcv^2)
+topTags(et)
+
+```
+
+Look at these peaks in Genome Browser and see what they are associated with. 
+Notice that many of these will not have corresponding `MACS2` differential peaks.
+Additionally, although `MACS2` called differential peaks it's hard to tell what is a real differential peak. 
+
+The next section (Yurii's ChIP-seq section) will look at how to annotate peaks and additional analysis that can suppliment differentially open chromatin analyses.
+
+&nbsp;
+
+```{r}
+
+sessionInfo()
+
+```

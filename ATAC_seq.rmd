@@ -1,0 +1,865 @@
+---
+title: "ATAC-seq Workshop: Part 1"
+author: "David Oliver"
+date: "November 10, 2017"
+output: 
+    html_document:
+        toc: true
+        toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F)
+```
+
+# 1. Pre-Alignment Processing
+
+## A. Downloading Publicly Available Data
+
+We will be working with data from "Chromatin Accessibility Landscape of Cutaneous T Cell Lymphoma and Dynamic Response to HDAC Inhibitors" [Published in Cell](http://dx.doi.org/10.1016/j.ccell.2017.05.008) earlier this year.
+
+Specifically we are going to be using data from CTCL patients treated with HDAC inhibitor Romidepsin (Istodax). 
+We are interested in how Romidepsin remodels the chromatin during treatment. 
+
+Once you've managed to make it past Cell's pay-wall, you can simply type `Ctrl+f` and `GEO` to find the GEO ID associated with the data in the paper.
+This paper's data is stored under GEO accession [GSE85853](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?token=adolemkoltcbncd&amp;acc=GSE85853). 
+There are 126 samples associated with this GEO accession. 
+At the bottom of the page you will find the associated SRA project ID SRP082417.
+
+If you want to download all the sequencing data associated with this SRA project ID we can do that in R using the following commands. 
+We won't actually run this here because you will download the entire SRA database file which is `35.4 GB` and the VM doesn't have that kind of storage available. 
+
+```{r, eval=F}
+
+####################################
+# R command NOT RUN
+####################################
+
+library(SRAdb)                               # load the SRAdb package
+srafile = getSRAdbFile()                     # download the SRA database file
+con = dbConnect(RSQLite::SQLite(), srafile)  # establish connection to the database (sqlite)
+listSRAfile('SRP082417', con)                # show all samples associated witht he project 
+getSRAfile('SRP082417', con, fileType='sra') # download all associated fastq files
+
+```
+
+If we only want a couple samples from a project we can get those using the sample specific **SRR** number. 
+For this workshop we will be looking at a CTCL patient 1461 who was treated with Romidepsin specifically looking at day 0 `Sample: BulkCTCL_Patient1461_Romi_Day0` and day 28 `Sample: BulkCTCL_Patient1461_Romi_Day28`.
+To get the associated SRR numbers for these samples we follow the `GSM` link next to the sample and then the `SRX` link at the bottom of that page and finally we arrive at a page where our SRR number exists `SRR4044837` and `SRR4044835`.
+
+Now that we have our SRR IDs in hand we can use the [SRA toolkit](https://github.com/ncbi/sra-tools/wiki/Downloads) to get the FASTQ files associated with the SRR ID. The `fastq-dump` command downloads the `.sra` file to your user directory under `ncbi/public/sra` and converts it to fastq.
+
+Once again we won't run this because these files are quite large and we don't have the power to handle aligning them. Also note that the SRA toolkit is a command line toolkit **NOT** an R package
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+mkdir -p ~/myProject/myFastQs       # make a new project directory and fastq dir
+cd ~/myProject/myFastQs             # move to a dir to store fastq files
+fastq-dump --split-files SRR4044835 # dump the SRR4044835_1.fastq and SRR4044835_2.fastq files
+fastq-dump --split-files SRR4044837 # dump the SRR4044837_1.fastq and SRR4044837_2.fastq files
+
+```
+
+&nbsp; 
+
+## B. Before Aligning
+
+The following code chunks will be **BASH** commands. These operations all have some R corollary but using R for these steps is highly inefficient and not recommended. 
+
+&nbsp; 
+
+### i. &nbsp;&nbsp;Setting Up the Genome Index
+
+UCSC maintains most of the available genomes.
+You can download the raw FASTA genome files from [UCSC's website](http://hgdownload.cse.ucsc.edu/downloads.html) by selecting your organism of interest (we're using human data here) and selecting [Full data set](http://hgdownload.cse.ucsc.edu/goldenPath/hg38/bigZips/).
+
+Alternately if you know your genome's location you can use `wget` or `curl` to download the file directly.
+
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+mkdir -p ~/myProject/hg38/Genome                                        # make a new genome dir
+cd ~/myProject/hg38/Genome                                              # move to the a genome dir
+wget http://hgdownload.cse.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz  # download the genome
+gunzip hg38.fa.gz                                                       # unzip the genome fasta file
+
+```
+
+We will use [bowtie2](http://bowtie-bio.sourceforge.net/bowtie2/index.shtml) for this example because it's what most people are using for ATAC-seq data (that doesn't mean it's the best!).
+Feel free to use whatever aligner you enjoy most (I like [STAR](https://github.com/alexdobin/STAR) personally).
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+mkdir -p ~/myProject/hg38/Genome/bt2                           # move to a directory for your bowtie2 index
+bowtie2-build ~/Genomics/genomes_2/hg38/Genome/hg38.fa.gz hg38 # build the bowtie2 index with default parameters
+
+```
+
+&nbsp; 
+
+### ii. &nbsp;Cleaning Up the Sequences
+
+Now that you have your theoretical genome built and ready to go we can start pre-processing the fastq files.
+I use [Trim Galore](https://www.bioinformatics.babraham.ac.uk/projects/trim_galore/) which is a wrapper function for [Cutadapt](https://cutadapt.readthedocs.io/en/stable/) and [FastQC](https://www.bioinformatics.babraham.ac.uk/projects/fastqc/).
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+mkdir ~/myProject/processed                # make a directory for our processed files
+cd ~/myProject/processed                   # move into the processed directory
+trim_galore --paired \                     # run trim galor in paired end mode
+--fastqc \                                 # run fastqc as well
+--output_dir ./ \                          # output prefix
+~/myProject/myFastQs/SRR4044835_1.fastq \  # read 1
+~/myProject/myFastQs/SRR4044835_2.fastq    # read 2
+
+trim_galore --paired --fastqc --output_dir ./ ~/myProject/myFastQs/SRR4044837_1.fastq ~/myProject/myFastQs/SRR4044837_2.fastq
+
+```
+
+&nbsp; 
+
+### iii. Checking FastQC Output for Major Issues
+
+![FastQC Per Base Quality Scores (Read 1)](R/SRR4044835_1_per_base_quality.png){ width=50% }
+
+![FastQC GC Content Distribution (Read 1)](R/SRR4044835_1_kmer_profiles.png){ width=50% }
+
+The Quality score looks perfect. 
+Looks like there is an issue with possible adapter contamination? 
+It's probably safe to move forward with the alignment but we should probably set the aligner to local for best results.
+
+&nbsp; 
+
+# 2. Aligning to the Genome
+
+Based on the output of FastQC we will set bowtie2 to align using the local alignment option just in case we have additional adapters.
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+mkdir ~/myProject/aligned    
+cd ~/myProject/aligned
+bowtie2 --local \                                 # Run bowtie2 in local mode
+-p 12 \                                           # number of threads to use for alignment
+-x ~/myProject/hg38/Genome/bt2/hg38 \             # path to the index plus prefix
+-1 ~/myProject/processed/SRR4044837_1_val_1.fq \  # Read 1 
+-2 ~/myProject/processed/SRR4044837_2_val_2.fq \  # Read 2
+-S SRR4044837.sam \                               # name of the output in SAM format
+2> SRR4044837.bowtie2.txt                         # send stderr to a txt file for later processing
+
+bowtie2 --local -p 12 -x ~/myProject/hg38/Genome/bt2 -1 ~/myProject/processed/SRR4044835_1_val_1.fq -2 ~/myProject/processed/SRR4044835_2_val_2.fq -S SRR4044835.sam 2> SRR4044835.bowtie2.txt
+
+```
+
+Check the summary report for the alignments. 
+
+```{bash}
+echo "SRR4044835 alignment summary"
+cat R/SRR4044835.bowtie2.txt
+
+```
+
+```{bash}
+echo "SRR4044837 alignment summary"
+cat R/SRR4044837.bowtie2.txt
+
+```
+
+&nbsp; 
+
+![_Borrowed from IGV User Guide_](R/readpairorientations.jpg)
+
+&nbsp; 
+
+The first section of the output tells us about the concordant alignment rate. 
+`61.49% + 33.69% = 95.18%` of our reads were paired and aligned at least once concordantly. 
+What does concordance mean when talking about paired end alignment?
+
+The next section of the report deals with the bowtie's first attempt to deal with the `4.82%` of reads that failed to align at least once concordantly. 
+Bowtie2 finds discordant alignments for `33.84%` of these reads. 
+
+The last section deals with the remaining `66.16% of the 4.82%` of reads that didn't align concordantly and Bowtie2 couldn't find a good discordant alignment for. 
+By treating these reads as unpaired alignments, Bowtie finds at least 1 alignment for `83.80%` of these.
+
+The overall alignment rate then is `99.48%`.
+
+&nbsp; 
+
+# 3. Post-Alignment Read Processing
+
+Once the alignment is done, and if the alignment looks good, the aligned reads need to be cleaned up before moving forward. 
+As a last step, for the purposes of this workshop the reads will be subset to only those reads aligning to `chr19` so that we can start doing things in real time.
+
+&nbsp; 
+
+## A. Filtering and Sorting Alignements 
+
+`Samtools` provides a set of tools for manipulating `SAM` and `BAM` files including filtering, sorting, indexing, as well as many, many other tools.
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+mkdir ~/myProject/post
+samtools view -ubh \                       # view the SAM file as uncompressed (u) BAM (b) including headers (h) 
+-q 1 \                                     # only include reads with a qual score >=1 (unaligned reads get 0)
+-F 2828 \                                  # discard (F) unmapped, non-primary, qc failed, and supp alignments
+-@ 10 \                                    # use 10 threads (@)
+SRR4044835.sam | \                         # From input SAM and pipe the output onwards (|)
+samtools sort -@ 10 \                          # Sort the alignments using 10 threads
+-o ~/myProject/post/SRR4044835_filtered.bam \  # write the output BAM
+-                                              # Get input from STDIN (|)
+
+samtools view -ubh -q 1 -F 2828 -@ 10 SRR4044837.sam | samtools sort -@ 10 -o ~/myProject/post/SRR4044837_filtered.bam -
+
+```
+
+For all the filtering options available, check [SAM Flags Explained.](https://broadinstitute.github.io/picard/explain-flags.html).
+
+Also note that we've simply removed multi-mapping reads here causing the loss of ~6 million reads. 
+There are approaches for rescuing these multi-mappers but they are not often used and no meta-analysis of whether these approaches actually improve analysis has been performed to date. 
+Check out [MMR](https://academic.oup.com/bioinformatics/article/32/5/770/1743383) for a quick introduction to the subject.
+
+&nbsp;
+
+## B. Removing PCR Duplicates.
+
+In order to remove PCR duplicates they must be marked as duplicates using [Picard's MarkDuplicates](http://broadinstitute.github.io/picard/command-line-overview.html#MarkDuplicates) function.
+This step is performed after initial filtering to improve performance.
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+java -Xmx12g -jar /opt/picard.jar MarkDuplicates \    # start Picard MarkDuplicates with 12Gb of RAM
+REMOVE_DUPLICATES=TRUE \                              # Remove duplicates if found (don't just mark them)
+I=~/myProject/post/SRR4044835_filtered.bam \          # Input BAM
+O=~/myProject/post/SRR4044835_filtered_noDup.bam \    # Output BAM
+METRICS_FILE=~/myProject/post/SRR4044835_dedup.txt \  # Generate a metrics file
+VALIDATION_STRINGENCY=LENIENT \                       # Try not to complain too much
+ASSUME_SORTED=TRUE                                    # The input BAM is sorted
+
+java -Xmx12g -jar /opt/picard.jar MarkDuplicates REMOVE_DUPLICATES=TRUE I=~/myProject/post/SRR4044837_filtered.bam O=~/myProject/post/SRR4044837_filtered_noDup.bam METRICS_FILE=~/myProject/post/SRR4044837_dedup.txt VALIDATION_STRINGENCY=LENIENT ASSUME_SORTED=TRUE
+
+```
+
+`MarkDuplicates` metric file provides some summary statistics.
+
+```{r}
+####################################
+# R command
+####################################
+library(knitr)
+SRR4044835_dedup <- read.table(file = "R/SRR4044835_dedup.txt",  # read in our dedup metrics
+                               nrows = 1,                        # Only grab the first row (after headers)
+                               header = T)                       # use the first row as headers
+SRR4044837_dedup <- read.table(file = "R/SRR4044837_dedup.txt",  
+                               nrows = 1, 
+                               header = T)
+dedup_summary <- rbind(SRR4044835_dedup[,c(3,7,9)], 
+                       SRR4044837_dedup[,c(3,7,9)])              # combine our two library metrics
+rownames(dedup_summary) <- c("SRR4044835", "SRR4044837")         # add meaningful names
+kable(dedup_summary)                                             # make a pretty html table
+
+```
+
+About `4.5% - 7%` of these libraries were PCR duplicates.
+
+Picard also provides a nice metric for whether or not additional sequencing would improve coverage based on how much duplication was observed.
+
+```{r}
+####################################
+# R command
+####################################
+SRR4044835 <- read.table(file = "R/SRR4044835_dedup.txt",  # read in our dedup metrics
+                         skip = 10,                        # skip to the data we want
+                         header = T)                       # use the first row as headers
+SRR4044837 <- read.table(file = "R/SRR4044837_dedup.txt", 
+                         skip = 10, 
+                         header = T)
+
+plot(x    = SRR4044837$BIN,                # plot BIN as X values
+     y    = SRR4044837$VALUE,              # plot VALUE as Y values
+     xlim = c(0,50),                       # set the range of Xs to 0-50
+     type = "l",                           # plot the data as a line
+     lwd  = 2,                             # set the line width to 2
+     col  = "dodgerblue",                  # set the color of the line
+     xlab = "Coverage Multiplier",         # x label
+     ylab = "Additional Actual Coverage",  # y label
+     main = "ROI for Deeper Sequencing")   # main title
+lines(x   = SRR4044835$BIN,                # add a line to the existing plot
+      y   = SRR4044835$VALUE, 
+      lwd = 2, 
+      col = "orange")
+segments(x0  = 5, x1  = 5,                        # add a line segment to the existing plot
+         y0  = 0, y1  = SRR4044837$VALUE[5], 
+         col = "red", lwd = 2,
+         lty = 2)                                 # set the line type to 2 (dashes)
+segments(x0 = -2, x1 = 5, 
+         y0 = SRR4044837$VALUE[5], 
+         y1 = SRR4044837$VALUE[5], 
+         col = "red", lty = 2, lwd = 2)
+legend("topleft",                                 # add a legend to the top left of the plot
+       lwd = 2, 
+       col = c("dodgerblue", "orange"), 
+       legend = (c("SRR4044837", "SRR4044835")))
+text(x = 30,                                      # add additional descriptive text
+     y = 3,                              
+     labels = "For these two libraries, sequencing an additional 5x\nwould result in ~4x real coverage added")
+
+```
+
+&nbsp;
+
+## C. Removing chrM Reads
+
+Samtools' `idxstats` function returns the number of reads aligning to each chromosome. 
+The percentage of reads aligning to chrM can be a useful metric for the quality of the ATAC-seq experiment.
+Although reads aligning to chrM can often be  greater than 50%, a well done ATAC-seq experiment should have less than 5% of reads aligning to chrM. 
+
+First generate the index using Samtools' `index` function.
+The `bai` index is also used by almost every program for downstream BAM manipulation allowing them to find reads quickly and efficiently.
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+cd ~/myProject/post
+samtools index SRR4044835_filtered_noDup.bam  # generate an index for the bam file. 
+samtools index SRR4044837_filtered_noDup.bam
+
+samtools idxstats SRR4044835_filtered_noDup.bam > SRR4044835_idxStats.txt  # write the index stats to file
+samtools idxstats SRR4044837_filtered_noDup.bam > SRR4044837_idxStats.txt
+
+```
+
+Visualize the index statistics.
+
+```{r}
+####################################
+# R command
+####################################
+library(gtools); library(magrittr); library(plyr)
+SRR4044835_idxStats <- 
+    read.delim("R/SRR4044835_idxStats.txt", 
+               stringsAsFactors = F,         # don't convert strings to factors
+               header = F) %>%               # the `%>%` operator is equivalent to `|`
+    .[mixedorder(.$V1),] %>%                 # mixed sort so chr1 is followed by chr2 (not chr10)
+    mutate(., Percent = V3/sum(V3)*100)      # create a new column with percentage of reads
+SRR4044837_idxStats <- 
+    read.delim("R/SRR4044837_idxStats.txt", stringsAsFactors = F, header = F) %>%
+    .[mixedorder(.$V1),] %>%
+    mutate(., Percent = V3/sum(V3)*100)
+
+rbind(SRR4044835_idxStats$Percent,                          # combine both datasets
+      SRR4044837_idxStats$Percent) %>%
+    barplot(., beside = T,                                  # barplot the two datasets side by side
+            names.arg = SRR4044835_idxStats$V1,             # use the chromosome names
+            las = 2,                                        # plot the xlab vertically
+            col = c("dodgerblue", "orange"),                # colors
+            main = "Percentage of Reads by Chromosome",     # main title
+            ylab = "Percentage")                            # y label
+legend("topright", legend = c("SRR4044835", "SRR4044837"),  # add a legend
+       col = c("dodgerblue", "orange"), pch = 15)
+
+```
+
+Now remove the chrM reads.
+This step uses Samtools instead of a simple grep command because it scales to large datasets.
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+cat SRR4044835_idxStats.txt | \    # Read the indxstats to STDIN 
+cut -f 1 | \                       # Get the chromosome names
+grep -v chrM | \                   # Remove chrM from the list of chromosomes
+xargs samtools view -hb \          # pass the chromosome names to samtools
+SRR4044835_filtered_noDup.bam > \  # the file to keep chromosomes
+SRR4044835_filtered_noDup_noM.bam  # the output chrM removed
+
+cat SRR4044837_idxStats.txt | cut -f 1 | grep -v chrM | xargs samtools view -hb SRR4044837_filtered_noDup.bam > SRR4044837_filtered_noDup_noM.bam
+
+```
+
+&nbsp; 
+
+## D. Removeing Blacklisted Regions 
+
+There are a set of regions in the genome that are considered "black listed" due to artifacts in both genome assembly and highly repetitive regions with hyper mappability. 
+
+![](R/BlackListed.png){width=70%}
+
+See [this readme](https://personal.broadinstitute.org/anshul/projects/encode/rawdata/blacklists/hg19-blacklist-README.pdf) for a thorough description about how blacklisted regions are annotated.
+
+The blacklisted regions for hg38 can be downloaded from [here](http://mitra.stanford.edu/kundaje/akundaje/release/blacklists/hg38-human/hg38.blacklist.bed.gz). 
+Notice that the blacklist for hg38 only contains 38 regions (226 in hg19). 
+This is mostly due to improvements in the hg38 build.
+
+&nbsp; 
+
+`Bedtools` provides a set of tools for manipulating `BED` files including subsetting, indexing, and statistical calculations.
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+cd ~/myProject
+wget http://mitra.stanford.edu/kundaje/akundaje/release/blacklists/hg38-human/hg38.blacklist.bed.gz
+gunzip hg38.blacklist.bed.gz
+
+cd ~/myProject/post
+bedtools subtract \                        # bedtools subtract function
+-A \                                       # remove all reads from a overlapping file b
+-abam SRR4044835_filtered_noDup_noM.bam \  # file a is a bam file
+-b ~/myProject/hg38.blacklist.bed > \      # file b is out blacklist regions
+SRR4044835_filtered_noDup_noM_noblack.bam  # write the output
+
+bedtools subtract -A -abam SRR4044837_filtered_noDup_noM.bam -b ~/myProject/hg38.blacklist.bed > SRR4044837_filtered_noDup_noM_noblack.bam
+
+```
+
+&nbsp; 
+
+## E. Adjusting Read Location for Tn5 Cutting
+
+The final step in post-processing is to adjust the read positions by a small offset in order to align the read to it's true location. 
+Because the Tn5 transposase cuts in a staggered fashion, the resulting library of reads have `+` strand shifted downstream 4bp while the `-` strand is shifted upstream 5bp.
+Reversing this improves the accuracy of the open chromatin prediction.
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+####################################
+# BEGIN Tn5Adjust.sh script
+
+#!/bin/bash -l
+# Adjusts BAM read-ends by Tn5 offsets (+4 for forward, and -5 for reverse)
+tn5_adjust='        # tn5_adjust is an awk function
+BEGIN {OFS = FS} {  # use the set the original files field separator
+  if ($2 == 0) {    # if the read is on the positive strand
+    $4 = $4 + 4     # shift the alignment upstream 4bp
+  } else {          
+    $4 = $4 - 5     # else shift it downstream 5bp
+  }
+  if ($4 < 1) {     # if we hit the beginning of the chromosome do nothing
+      $4 = 1
+  }
+  print $0          # return all rows
+}
+'
+SAMPLE=$1                                    # The input BAM   
+THREADS=$2                                   # Number of threads for samtools
+samtools view -H $1 > ${SAMPLE}.tmp          # Store the original header
+samtools view $1 | \                         # Read in the BAM as SAM
+awk -F $'\t' "$tn5_adjust" >> ${SAMPLE}.tmp  # Run the awk function appending to the header file
+samtools view -hb -@ $THREADS \              # Revert SAM back to BAM
+-o ${SAMPLE%.bam}_tn5Adj.bam ${SAMPLE}.tmp   # The output file
+rm ${SAMPLE}.tmp                             # remove the tmp file
+exit 0
+
+# END Tn5Adjust.sh script
+#############################
+
+tn5Adjust.sh SRR4044835_filtered_noDup_noM_noblack.bam 12
+tn5Adjust.sh SRR4044837_filtered_noDup_noM_noblack.bam 12
+
+```
+
+&nbsp; 
+
+## F. Final Sorting and Regenerating Index
+
+Since the reads have been shuffled and dropped the final BAM needs to be re-sorted and re-indexed.
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+samtools sort -@ 10 -o SRR4044835_filtered_noDup_noM_noblack_tn5Adj_sorted.bam SRR4044835_filtered_noDup_noM_noblack_tn5Adj.bam
+samtools sort -@ 10 -o SRR4044837_filtered_noDup_noM_noblack_tn5Adj_sorted.bam SRR4044837_filtered_noDup_noM_noblack_tn5Adj.bam
+
+samtools index SRR4044835_filtered_noDup_noM_noblack_tn5Adj_sorted.bam
+samtools index SRR4044837_filtered_noDup_noM_noblack_tn5Adj_sorted.bam
+
+```
+
+I've presented the above section in a procedural format but in reality this is all written into a single script which can be distributed to a node on the server cluster and runs rather painlessly.
+
+&nbsp; 
+
+# 4. Peak Calling
+
+Now that the data is cleaned and processed, it's time to call peaks. 
+[MACS2](https://github.com/taoliu/MACS) is the gold standard for ChIP and ATAC-seq peak calling.
+This doesn't mean it's the best, but it is the standard and used by ENCODE.
+
+&nbsp; 
+
+## A. Calling Peaks with `MACS2`
+
+`MACS2` is the recommended peak caller for ATAC-seq according to the [Encode Consortium](https://www.encodeproject.org/pipelines/ENCPL583EZV/). 
+It's fairly simple to use, light weight, and produces convenient outputs (including excel).
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+mkdir ~/myProject/peaks/
+for i in $(ls *_sorted.bam); do       # for each pseudoreplicate
+  macs2 callpeak --broad \            # MACS2 callpeaks function aggregating nearby peaks
+--format BAMPE \                      # let MACS2 use paired end information
+--nomodel --shift -37 --extsize 73 \  # Don't use default shift, instead use -37 and 73
+--bdg \                               # Create a bedgraph output
+--gsize 2.5e9 \                       # The mappable genome size
+-t $i \                               # Treatment file 
+-n ~/myProject/peaks/${i%.bam}        # Output prefix
+done
+
+```
+
+`MACS2` outputs bedgraph (`.bdg`), broadPeak (`.broadPeak`), gappedPeak (`gappedPeak`), and an excel (`.xls`) file all containing information about the peaks called. 
+
+&nbsp; 
+
+## B. Assessing Reproducibility
+
+In a case like this one where there are no biological replicates (this is often the case with ATAC-seq), reproducibility is measured at a technical, rather than biological, level.
+
+&nbsp;
+
+### i. Generating Pseudoreplicates
+
+In order to assess our peak reproducibility, the single samples must be split into pseudo-replicates.
+The following bash script performs this function. 
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+####################################
+# BEGIN splitBAM.sh
+
+#!/bin/bash -l
+# subsample BAM file for IDR on pseudoreplicates
+
+SAMPLE=$1
+THREADS=$2
+
+NLINES=$( samtools view ${SAMPLE} | wc -l )
+NLINES=$(( (NLINES + 1) / 2 ))
+
+OUTNAME=${SAMPLE%.bam}_sample_
+
+samtools view -H ${SAMPLE} > ${OUTNAME}00.sam
+cp ${OUTNAME}00.sam ${OUTNAME}01.sam
+
+samtools view ${SAMPLE} | shuf | split -d -l ${NLINES} - ${OUTNAME}
+cat ${OUTNAME}00 >> ${OUTNAME}00.sam
+cat ${OUTNAME}01 >> ${OUTNAME}01.sam
+
+samtools view -hb -@ ${THREADS} ${OUTNAME}00.sam -o ${OUTNAME}00.bam
+samtools view -hb -@ ${THREADS} ${OUTNAME}01.sam -o ${OUTNAME}01.bam
+
+rm ${OUTNAME}00.sam ${OUTNAME}01.sam ${OUTNAME}00 ${OUTNAME}01
+exit 0
+
+# END splitBAM.sh
+####################################
+
+splitBAM.sh SRR4044835_filtered_noDup_noM_noblack_tn5Adj_sorted.bam 12
+splitBAM.sh SRR4044837_filtered_noDup_noM_noblack_tn5Adj_sorted.bam 12
+
+for i in $(ls *_sample_*);          # for each pseudoreplicate
+  do samtools sort -@ 10 -o $i $i;  # sort in place
+done
+
+```
+
+&nbsp; 
+
+### ii. Calling Differential Peaks Between Pseudoreplicates
+
+Peaks are called as before.
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+for i in $(ls *_sample_*); do         # for each pseudoreplicate
+  macs2 callpeak --broad \            # MACS2 callpeaks function aggregating nearby peaks
+--format BAMPE \                      # let MACS2 use paired end information
+--nomodel --shift -37 --extsize 73 \  # Don't use default shift, instead use -37 and 73
+--bdg \                               # Create bedgraph output
+--gsize 2.5e9 \                       # The mappable genome size
+-t $i \                               # Treatment file 
+-n ~/myProject/peaks/${i%.bam}        # Output prefix
+done
+
+```
+
+`MACS2` produces bedGraphs which can be used in a separate call to the `bdgdiff` function of `MACS2`. 
+`MACS2 bdgdiff` calculates differential binding between experiments.
+
+In this case it will calculated differentially open regions between pseudo-replicates.
+Peaks called as differential between pseudo-replicates can be considered low stability and can be removed before further processing.
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+cd ~/myProject/peaks/
+macs2 bdgdiff \
+-l 147 \
+-g 73 \
+--t1 SRR4044835*00_treat_pileup.bdg \
+--t2 SRR4044835*01_treat_pileup.bdg \
+--c1 SRR4044835*00_control_lambda.bdg \
+--c2 SRR4044835*01_control_lambda.bdg \
+--o-prefix SRR4044835_PR
+
+macs2 bdgdiff -l 147 -g 73 --t1 SRR4044837*00_treat_pileup.bdg --t2 SRR4044837*01_treat_pileup.bdg --c1 SRR4044837*00_control_lambda.bdg --c2 SRR4044837*01_control_lambda.bdg --o-prefix SRR4044837_PR
+
+wc -l *.bed > ../R/bdgdiff.txt        # count the number of peaks in bdgdiff output
+wc -l *.broadPeak > ../R/numPeaks.txt # count number of peaks in original macs2 calls
+
+```
+
+
+```{r}
+library(edgeR)
+diff <- 
+    read.table("R/bdgdiff.txt", stringsAsFactors = F) %>%  # read in diff peaks
+    .[-7, ] %>%                                            # trim off empty columns
+    `colnames<-` (., c("Peaks", "Samples"))                # rename columns
+diff$Samples <-                                            
+    strsplit2(diff$Samples, "_")[,c(1,4)] %>%              # Fix sample names
+    apply(., 1, paste, collapse = "_")                     # more fixing
+    
+num <- 
+    read.table("R/numPeaks.txt", stringsAsFactors = F) %>% # read in original peak numbers
+    .[-7, ] %>%                                            # drop empty column
+    `colnames<-` (., c("Raw_Peaks", "Samples"))            # rename columns
+num$Samples <-
+    strsplit2(num$Samples, "_")[,c(1,9)] %>%               # fix sample names
+    apply(., 1, paste, collapse = "_") 
+
+cbind(num, diff) %>%                 # combine datasets
+    `rownames<-` (., .$Samples) %>%  # make rownames
+    .[,-2] %>%                       # drop columns that had rownames
+    kable()
+
+```
+
+Of the original ~28k peaks in the `SRR4044835` sample, ~10k were stable after subsampling.
+Only ~1.3k peaks were stable in the `SRR4044837` sample out of the original ~13k.
+This indicates that the depth of sequencing for `SRR4044837` is too low and re-sequencing this sample would significantly improve the analysis.
+
+&nbsp; 
+
+## C. Counting Reads in Peaks and Calculating FRiP
+
+reproducibility between pseudo-replicates is used to determine if there is strong evidence for a particular peak call. 
+This is an ad-hoc method for incorporating replicate information into ChIP and ATAC-seq peak calling. 
+
+&nbsp; 
+
+### i. &nbsp;Generate Feature Table
+
+First, generate a GTF file from the full depth `MACS2` peaks. This requires 2 tools from the `UCSC toolkit`: `bedToGenePred` and `genePredToGtf`. 
+These tools can be found [here](https://github.com/ENCODE-DCC/kentUtils) and are named after the developer (Jim Kent) for some unknown reason.
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+mkdir ~/myProject/annotations
+cat $(ls *sorted_peaks.broadPeak) | \            # concatentate all the peaks (necessary whne more than 2 samples)
+cut -f 1,2,3,4 | \                               # cut everything beyond the first 4 columns (broadPeak -> bed)
+sort -k 1,1 -k 2,2n | \                          # sort by chromosome and then position
+bedtools merge -d 150 -c 4 -o first -i - | \     # merge peaks within 150bp and select first peak name
+bedToGenePred stdin stdout | \                   # convert from bed to predicted "genes"
+genePredToGtf file stdin stdout | \              # creat a GTF file from the "predicted genes"
+tr '\000' '.' | \                                # clean up a strange conversion issue
+awk '{if ($3 == "exon") print $0;}' > \          # only keep exon's (reduces the size of the gtf)                      
+~/myProject/annotations/AllPeaks_union.gtf       # write it to gtf file
+
+```
+
+&nbsp; 
+
+### ii. Count Reads in Features
+
+Next, the number of reads overlapping the peaks in the newly generated GTF file can be counted.
+[featureCounts](http://bioinf.wehi.edu.au/featureCounts/) is a part of the [Subreads](http://subread.sourceforge.net/) software which was designed to streamline the RNA-seq alignment, counting, and differential expression pipeline.
+This is by far the best available read count package.
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+cd ~/myProject/annotations/
+BAMFILES=`find ~/myProject/post -name "*_sorted.bam" | tr '\n' ' '`  # find bam files for counting
+
+featureCounts -T 6 \     # run featureCounts with 6 threads          
+-f \                     # summarize at the exon level
+-O \                     # count fraction of multi-overlapping reads
+-t exon \                # count reads in exons
+-g gene_id \             # use gene_id as name field
+-a AllPeaks_union.gtf \  # our annotation file
+-o Peak_counts.txt \     # write the output
+$BAMFILES 2> \           # take input bams and send STDERR on
+Peak_counts.log          # write STDERR to log file
+
+```
+
+The ENCODE Consortium scrutinizes experiments in which the FRiP falls below 1%.
+We can get the FRiP score from the featureCount log file.
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+find ../post -name "*_sorted.bam" | \   # find the bam files
+cut -d'/' -f3 | \                       # remove leading directory names
+cut -d'_' -f1,7,8,9 > \                 # just the important bits
+../R/bam_names.txt                      # write it to file
+
+grep Successfully Peak_counts.log | \   # find the keyword 'Successfully' in the log file
+tr -d '||' | \                          # remove some ugly stuff
+cut -d':' -f2 > \                       # return just the FRiP score
+../R/FRiP.txt                           # write it to a file
+
+```
+
+Switch over to `R` to print the FRiP score in a pretty table. 
+
+```{r}
+
+bamnames <- read.table("R/bam_names.txt", stringsAsFactors = F) 
+frip <- 
+    read.table("R/FRiP.txt") %>%
+    cbind(bamnames, .) %>% 
+    `colnames<-` (., c("BAM", "READS", "FRiP"))
+
+kable(frip[order(frip$BAM),])
+
+```
+
+The FRiP score shows that the experiment is within ENCODE's standards. 
+Additionally, sample SRR4044837 seems to have underperformed compared to SRR4044835.
+
+&nbsp; 
+
+## D. Differentially Open Chromatin
+
+The final step is to calculate differentially open chromatin between samples with MACS2.
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+macs2 bdgdiff \
+-l 147 \
+-g 73 \
+--t1 ../peaks/SRR4044835*sorted_treat_pileup.bdg \
+--t2 ../peaks/SRR4044837*sorted_treat_pileup.bdg \
+--c1 ../peaks/SRR4044835*sorted_control_lambda.bdg \
+--c2 ../peaks/SRR4044837*sorted_control_lambda.bdg \
+--o-prefix Diff_Open_Chromatin
+
+```
+
+The next portion of this workshop will cover working with these data.
+
+&nbsp;
+
+# 5. MultiQC
+
+[MultiQC](http://multiqc.info/) is not specifically for ATAC-seq but it is an amazing tool for QC.
+`MultiQC` aggregates all QC metrics from 56 different programs.
+
+`MultiQC` is run as the last check for quality of each step of the pipeline. 
+`MultiQC` collects stats for `Cutadapt`, `FastQC`, `bowtie2`, `MACS2`, and `featureCount`.
+Probably the most useful bioinformatics tool that's been released in the past 2 years.
+The [final report](R/multiqc_report.html) is in html format.
+
+&nbsp; 
+
+# 6. NucleoATAC
+
+The [NucleoATAC](http://nucleoatac.readthedocs.io/en/latest/) is a program for calling nucleosome positions and occupancy using ATAC-Seq data. 
+See the [Genome Research](http://genome.cshlp.org/content/25/11/1757) paper for detailed description of the biological interpretation of these data.
+
+The program is broken down into two portions `nucleoatac` and `pyatac` which perform complementary functions.
+In addition to these two functions the Greenleaf lab has provided an [NucleoATACR](https://github.com/GreenleafLab/NucleoATACR) for working with the output from NucleoATAC in R.
+
+Before running `nucleoatac`, the genome fasta must be indexed using `samtools faidx`. 
+NucleoATAC generates nucleosome occupancy tracks, normalized V-plots, nucleosome dyad calls, and nucleosome free positions.
+
+```{bash, eval = F}
+####################################
+# BASH command NOT RUN
+####################################
+
+samtools faidx ~/myProject/hg38/Genome/genome.fa                  # Generate genome index
+
+nucleoatac run --cores 12 \                                       # run nucleoatac with 12 cores
+--bed ../peaks/SRR4044835*sorted_peaks.broadPeak \  # input bed file
+--bam ../post/SRR4044835*_sorted.bam \  # input bam file
+--fasta ~/myProject/hg38/Genome/genome.fa \                       # genome file (same dir as index)
+--out SRR4044835                                                  # output prefix
+
+for f in $(ls *.eps); 
+  do convert -density 100 $f -flatten ${f%.*}.png;                # convert eps to png
+done
+
+```
+
+![`occ` files contain occupancy information and `nfrpos` files contain nucleosome free positions](R/SRR4044835.occ_fit.png)
+
+![`nucpos` files contain nucleosome dyad calls](R/SRR4044835.nuc_dist.png)
+
+![`VMat` files contain V-plot data](R/SRR4044835.VMat.png)
+
+NucleoATACR can be used to generate these same figures with additional parameters from the NucleoATAC output files.
+
+&nbsp; 
+
+```{r}
+
+sessionInfo()
+
+```
+
+
